@@ -2,16 +2,18 @@
 
 `codelog` is a Rust CLI tool designed to test, apply, and review patch-based Markdown logs ("codelogs").
 
-With `codelog`, you can embed git patch codeblocks inside Markdown documentation or change logs. The tool parses ` ```patch ` blocks, ignores non-patch code, tests them safely inside temporary repository clones, applies them to working repositories, and pretty-prints diffs for review.
+The core philosophy behind `codelog` is that codebase changes should be accompanied by clear human explanations. Instead of raw git diffs, a codelog combines rich narrative context detailing **why** a patch is necessary and **what** it achieves alongside executable ` ```patch ` codeblocks.
+
+`codelog` parses ` ```patch ` blocks, ignores non-patch text and code, tests them safely inside temporary repository clones, applies them to working repositories, and pretty-prints diffs for review.
 
 ---
 
 ## Features
 
-- **Safe Dry-Run Testing (`codelog test`)**: Clones the current repository into a isolated temporary directory to safely test whether patches apply cleanly.
+- **Safe Dry-Run Testing (`codelog test`)**: Clones the current repository into an isolated temporary directory to safely test whether patches apply cleanly.
 - **Direct Application (`codelog apply`)**: Applies patch codeblocks directly to your active repository.
 - **Interactive Review (`codelog show`)**: Pretty-prints patch codeblocks. Integrates automatically with [`delta`](https://github.com/dandavison/delta) for enhanced diff syntax highlighting if installed.
-- **Selective Parsing**: Only extracts fenced codeblocks tagged with ` ```patch `. All other codeblocks (such as ` ```rust `, ` ```bash `, or un-tagged blocks) are ignored.
+- **Selective Parsing**: Only extracts fenced codeblocks tagged with ` ```patch `. All other markdown sections and codeblocks (such as ` ```rust `, ` ```bash `, or un-tagged blocks) are ignored during application while preserving full context for readers.
 - **Detailed Error Context**: On patch failure, `codelog` highlights the exact Markdown filename and line number of the failing patch block alongside the exact raw output from `git apply`.
 
 ---
@@ -40,21 +42,21 @@ codelog <SUBCOMMAND> [OPTIONS] <FILE>...
 Tests applying the patch codeblock(s) in the specified Markdown file(s) against a temporary clone of the current repository.
 
 ```bash
-codelog test instructions.md
+codelog test examples/feature-greeting.md
 ```
 
 #### 2. `codelog apply <file>...`
 Applies the patch codeblock(s) in the specified Markdown file(s) directly to the working directory repository.
 
 ```bash
-codelog apply instructions.md
+codelog apply examples/feature-greeting.md
 ```
 
 #### 3. `codelog show <file>...`
 Pretty-prints/reviews the patch codeblocks from the specified Markdown file(s). Uses [`delta`](https://github.com/dandavison/delta) for syntax highlighting when available.
 
 ```bash
-codelog show instructions.md
+codelog show examples/feature-greeting.md
 ```
 
 ---
@@ -82,14 +84,27 @@ codelog show instructions.md
 
 ## Codelog Markdown Format
 
-`codelog` searches Markdown files for fenced ` ```patch ` codeblocks. Other codeblocks are ignored during execution.
+A codelog is a Markdown file designed to explain the rationale behind changes while containing executable patch codeblocks.
 
-### Example Markdown (`changes.md`)
+An example codelog file is provided at [`examples/feature-greeting.md`](examples/feature-greeting.md):
 
 ````markdown
-# Feature Update: User Greeting
+# Codelog: Add User Greeting Feature
 
-Here is an example patch adding a new helper function:
+## Context & Motivation
+
+Currently, the application prints a generic `"Hello, world!"` message on startup.
+Users have requested a personalized greeting function so that the application can address specific users by name.
+
+This codelog documents the step-by-step patch modifications required.
+
+---
+
+## Step 1: Add `greet` Helper Function and Update `main`
+
+### Why this patch is needed:
+We need a reusable function `greet(name: &str)` in `src/main.rs` that encapsulates
+personalized greeting logic, and we need to update `main()` to invoke `greet("Alice")`.
 
 ```patch
 --- a/src/main.rs
@@ -105,11 +120,16 @@ Here is an example patch adding a new helper function:
  }
 ```
 
-The following codeblock will be ignored by `codelog` because it is not a patch block:
+---
+
+## Technical Notes (Ignored by `codelog`)
+
+Non-patch codeblocks are ignored during execution:
 
 ```rust
-fn example() {
-    // This code block is ignored by codelog apply/test
+// Note: Future async wrapper idea (ignored during codelog apply/test)
+async fn greet_async(name: String) {
+    tokio::task::spawn_blocking(move || greet(&name)).await.ok();
 }
 ```
 ````
@@ -121,19 +141,18 @@ fn example() {
 ### 1. Successful Test Run
 
 ```text
-$ codelog test instructions.md
+$ codelog test examples/feature-greeting.md
 [codelog] Cloned repository to temporary directory: /tmp/codelog-repo-a1b2c3
-[codelog] Found 3 patch codeblocks in instructions.md
+[codelog] Found 2 patch codeblocks in examples/feature-greeting.md
 
-[1/3] Applying patch block #1 (instructions.md:12)... SUCCESS
-[2/3] Applying patch block #2 (instructions.md:35)... SUCCESS
-[3/3] Applying patch block #3 (instructions.md:58)... SUCCESS
+[1/2] Applying patch block #1 (examples/feature-greeting.md:20)... SUCCESS
+[2/2] Applying patch block #2 (examples/feature-greeting.md:41)... SUCCESS
 
 ✔ All patches applied successfully in temporary repository!
 
 Follow-up steps:
   • Inspect changes in temp repo:  cd /tmp/codelog-repo-a1b2c3 && git diff
-  • Apply patches to main repo:     codelog apply instructions.md
+  • Apply patches to main repo:     codelog apply examples/feature-greeting.md
   • Clean up temporary clone:       rm -rf /tmp/codelog-repo-a1b2c3
 ```
 
@@ -142,14 +161,14 @@ Follow-up steps:
 When a patch fails to apply, `codelog` outputs the filename and line number in the Markdown file where the patch block starts, along with raw output from `git apply`:
 
 ```text
-$ codelog test instructions.md
+$ codelog test examples/feature-greeting.md
 [codelog] Cloned repository to temporary directory: /tmp/codelog-repo-x9y8z7
-[codelog] Found 3 patch codeblocks in instructions.md
+[codelog] Found 2 patch codeblocks in examples/feature-greeting.md
 
-[1/3] Applying patch block #1 (instructions.md:12)... SUCCESS
-[2/3] Applying patch block #2 (instructions.md:42)... FAILED
+[1/2] Applying patch block #1 (examples/feature-greeting.md:20)... SUCCESS
+[2/2] Applying patch block #2 (examples/feature-greeting.md:41)... FAILED
 
-✖ Error: Patch block #2 in instructions.md:42 failed to apply.
+✖ Error: Patch block #2 in examples/feature-greeting.md:41 failed to apply.
 
 --- Raw 'git apply' output ---
 error: patch failed: src/main.rs:15
@@ -157,8 +176,8 @@ error: src/main.rs: patch does not apply
 ------------------------------
 
 Follow-up steps:
-  • Edit and fix patch block #2 in instructions.md at line 42.
-  • Re-run 'codelog test instructions.md' to test the updated patches.
+  • Edit and fix patch block #2 in examples/feature-greeting.md at line 41.
+  • Re-run 'codelog test examples/feature-greeting.md' to test the updated patches.
 ```
 
 ---
