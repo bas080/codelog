@@ -23,8 +23,5 @@ jobs:
       - name: Run unit and integration tests
         run: cargo test --verbose
 
-      - name: Build codelog CLI
-        run: cargo build --release
-
-      - name: Run codelog test
-        run: ./target/release/codelog test
+      - name: Run codelog test using prebuilt binary
+        run: ./bin/codelog test
