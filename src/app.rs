@@ -14,7 +14,59 @@ pub fn run(cli: Cli) -> Result<()> {
         crate::cli::Commands::Test(args) => run_test(&args.files, cli.verbose),
         crate::cli::Commands::Apply(args) => run_apply(&args.files, cli.verbose),
         crate::cli::Commands::Show(args) => run_show(&args.files, cli.verbose),
+        crate::cli::Commands::Create => run_create(cli.verbose),
     }
+}
+
+pub fn extract_commit_hash_from_filename(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    if stem.len() == 40 && stem.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(stem.to_string())
+    } else {
+        None
+    }
+}
+
+fn get_head_commit_hash() -> Result<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .context("Failed to execute git rev-parse HEAD")?;
+
+    if !output.status.success() {
+        bail!("Failed to get HEAD commit hash");
+    }
+
+    let hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if hash.len() == 40 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(hash)
+    } else {
+        bail!("Invalid HEAD commit hash returned: {}", hash);
+    }
+}
+
+fn run_create(verbose: bool) -> Result<()> {
+    let hash = get_head_commit_hash()?;
+    let codelog_dir = PathBuf::from("codelog");
+    fs::create_dir_all(&codelog_dir)?;
+
+    let target_file = codelog_dir.join(format!("{}.md", hash));
+    if target_file.exists() {
+        if verbose {
+            println!("[codelog] File already exists: {}", target_file.display());
+        } else {
+            println!("Codelog file already exists: {}", target_file.display());
+        }
+        return Ok(());
+    }
+
+    let template = format!(
+        "# Codelog: Commit {}\n\n## Context & Motivation\n\nExplain why this change is necessary.\n\n```patch\n\n```\n",
+        hash
+    );
+    fs::write(&target_file, template)?;
+    println!("Created codelog file: {}", target_file.display());
+    Ok(())
 }
 
 fn apply_patch_to_dir(repo_dir: &Path, patch: &PatchBlock) -> Result<(), String> {
@@ -54,11 +106,8 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
         let ty = entry.file_type()?;
         let dst_path = dst.join(entry.file_name());
 
-        if entry.file_name() == "target" || entry.file_name() == ".git" {
-            // Include .git so git apply works inside the temporary repository clone
-            if entry.file_name() == "target" {
-                continue;
-            }
+        if entry.file_name() == "target" {
+            continue;
         }
 
         if ty.is_dir() {
@@ -99,17 +148,10 @@ fn prepare_temp_repo() -> Result<(PathBuf, Option<TempDir>)> {
 fn run_test(files: &[PathBuf], verbose: bool) -> Result<()> {
     let (temp_repo_dir, _temp_dir_guard) = prepare_temp_repo()?;
 
-    if verbose {
-        println!(
-            "[codelog] Cloned repository to temporary directory: {}",
-            temp_repo_dir.display()
-        );
-    } else {
-        println!(
-            "[codelog] Cloned repository to temporary directory: {}",
-            temp_repo_dir.display()
-        );
-    }
+    println!(
+        "[codelog] Cloned repository to temporary directory: {}",
+        temp_repo_dir.display()
+    );
 
     let mut total_blocks = Vec::new();
     for file in files {
@@ -130,39 +172,109 @@ fn run_test(files: &[PathBuf], verbose: bool) -> Result<()> {
     );
     println!();
 
-    let total_count = total_blocks.len();
-    for (i, patch) in total_blocks.iter().enumerate() {
-        let idx = i + 1;
-        let file_str = patch.file_path.display();
-        print!(
-            "[{}/{}] Applying patch block #{} ({}:{})... ",
-            idx, total_count, patch.index, file_str, patch.start_line
-        );
-        std::io::stdout().flush().ok();
+    for file in files {
+        let blocks = parse_patch_blocks(file)?;
 
-        match apply_patch_to_dir(&temp_repo_dir, patch) {
-            Ok(()) => {
-                println!("SUCCESS");
+        if let Some(target_hash) = extract_commit_hash_from_filename(file) {
+            let parent_commit = format!("{}~1", target_hash);
+            if verbose {
+                println!(
+                    "[codelog] Checking out parent commit {} in temporary repository...",
+                    parent_commit
+                );
             }
-            Err(err_msg) => {
-                println!("FAILED\n");
-                println!(
-                    "✖ Error: Patch block #{} in {}:{} failed to apply.\n",
-                    patch.index, file_str, patch.start_line
+            let checkout_output = Command::new("git")
+                .current_dir(&temp_repo_dir)
+                .args(["checkout", "-q", &parent_commit])
+                .output()
+                .context("Failed to checkout parent commit in temporary repository")?;
+
+            if !checkout_output.status.success() {
+                let err = String::from_utf8_lossy(&checkout_output.stderr);
+                bail!(
+                    "Failed to checkout parent commit {} in temp repo: {}",
+                    parent_commit,
+                    err
                 );
-                println!("--- Raw 'git apply' output ---");
-                println!("{}", err_msg);
-                println!("------------------------------\n");
-                println!("Follow-up steps:");
-                println!(
-                    "  • Edit and fix patch block #{} in {} at line {}.",
-                    patch.index, file_str, patch.start_line
+            }
+
+            let total_count = blocks.len();
+            for (i, patch) in blocks.iter().enumerate() {
+                let idx = i + 1;
+                let file_str = patch.file_path.display();
+                print!(
+                    "[{}/{}] Applying patch block #{} ({}:{})... ",
+                    idx, total_count, patch.index, file_str, patch.start_line
                 );
+                std::io::stdout().flush().ok();
+
+                match apply_patch_to_dir(&temp_repo_dir, patch) {
+                    Ok(()) => {
+                        println!("SUCCESS");
+                    }
+                    Err(err_msg) => {
+                        println!("FAILED\n");
+                        println!(
+                            "✖ Error: Patch block #{} in {}:{} failed to apply.\n",
+                            patch.index, file_str, patch.start_line
+                        );
+                        println!("--- Raw 'git apply' output ---");
+                        println!("{}", err_msg);
+                        println!("------------------------------\n");
+                        bail!("Patch execution failed.");
+                    }
+                }
+            }
+
+            if verbose {
                 println!(
-                    "  • Re-run 'codelog test {}' to test the updated patches.",
-                    file_str
+                    "[codelog] Verifying diff against target commit {}...",
+                    target_hash
                 );
-                bail!("Patch execution failed.");
+            }
+            let diff_output = Command::new("git")
+                .current_dir(&temp_repo_dir)
+                .args(["diff", "--exit-code", &target_hash])
+                .output()
+                .context("Failed to execute git diff in temporary repository")?;
+
+            if !diff_output.status.success() {
+                let diff_str = String::from_utf8_lossy(&diff_output.stdout);
+                println!("✖ Error: State after applying patches does not match commit {}.", target_hash);
+                if !diff_str.is_empty() {
+                    println!("--- Git Diff Output ---");
+                    println!("{}", diff_str);
+                    println!("----------------------");
+                }
+                bail!("State after applying codelog patches differs from commit {}.", target_hash);
+            }
+        } else {
+            let total_count = blocks.len();
+            for (i, patch) in blocks.iter().enumerate() {
+                let idx = i + 1;
+                let file_str = patch.file_path.display();
+                print!(
+                    "[{}/{}] Applying patch block #{} ({}:{})... ",
+                    idx, total_count, patch.index, file_str, patch.start_line
+                );
+                std::io::stdout().flush().ok();
+
+                match apply_patch_to_dir(&temp_repo_dir, patch) {
+                    Ok(()) => {
+                        println!("SUCCESS");
+                    }
+                    Err(err_msg) => {
+                        println!("FAILED\n");
+                        println!(
+                            "✖ Error: Patch block #{} in {}:{} failed to apply.\n",
+                            patch.index, file_str, patch.start_line
+                        );
+                        println!("--- Raw 'git apply' output ---");
+                        println!("{}", err_msg);
+                        println!("------------------------------\n");
+                        bail!("Patch execution failed.");
+                    }
+                }
             }
         }
     }
@@ -238,7 +350,6 @@ fn is_delta_available() -> bool {
         return true;
     }
 
-    // Auto-detect if `delta` binary exists in PATH
     Command::new("delta")
         .arg("--version")
         .stdout(Stdio::null())
@@ -279,14 +390,13 @@ fn run_show(files: &[PathBuf], _verbose: bool) -> Result<()> {
                 }
             }
 
-            // Fallback display with simple diff syntax highlighting colors
             for line in patch.content.lines() {
                 if line.starts_with('+') && !line.starts_with("+++") {
-                    println!("\x1b[32m{}\x1b[0m", line); // Green
+                    println!("\x1b[32m{}\x1b[0m", line);
                 } else if line.starts_with('-') && !line.starts_with("---") {
-                    println!("\x1b[31m{}\x1b[0m", line); // Red
+                    println!("\x1b[31m{}\x1b[0m", line);
                 } else if line.starts_with('@') {
-                    println!("\x1b[36m{}\x1b[0m", line); // Cyan
+                    println!("\x1b[36m{}\x1b[0m", line);
                 } else {
                     println!("{}", line);
                 }

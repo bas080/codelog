@@ -30,6 +30,9 @@ pub enum Commands {
 
     #[command(about = "Pretty-prints/reviews patch codeblocks from Markdown file(s)")]
     Show(FileArgs),
+
+    #[command(about = "Creates a new codelog file in codelog/<HEAD_hash>.md if it does not exist")]
+    Create,
 }
 
 #[derive(clap::Args, Debug)]
