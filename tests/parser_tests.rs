@@ -1,7 +1,7 @@
-use codelog::app::extract_commit_hash_from_filename;
+use codelog::app::resolve_and_sort_files;
 use codelog::parser::{byte_offset_to_line_number, parse_patch_blocks};
 use std::fs;
-use std::path::Path;
+use std::path::PathBuf;
 use tempfile::NamedTempFile;
 
 #[test]
@@ -14,15 +14,19 @@ fn test_byte_offset_to_line_number() {
 }
 
 #[test]
-fn test_extract_commit_hash_from_filename() {
-    let valid = Path::new("codelog/3682e00f9d19673e4a394269f91a3ef646811c3c.md");
+fn test_resolve_and_sort_files() {
+    let files = vec![
+        PathBuf::from("codelog/0002-second.md"),
+        PathBuf::from("codelog/0001-first.md"),
+    ];
+    let sorted = resolve_and_sort_files(&files).unwrap();
     assert_eq!(
-        extract_commit_hash_from_filename(valid),
-        Some("3682e00f9d19673e4a394269f91a3ef646811c3c".to_string())
+        sorted,
+        vec![
+            PathBuf::from("codelog/0001-first.md"),
+            PathBuf::from("codelog/0002-second.md"),
+        ]
     );
-
-    let invalid = Path::new("codelog/feature-greeting.md");
-    assert_eq!(extract_commit_hash_from_filename(invalid), None);
 }
 
 #[test]
@@ -33,11 +37,10 @@ fn test_parse_patch_blocks_single() {
 Some text.
 
 ```patch
---- a/file.txt
+--- /dev/null
 +++ b/file.txt
-@@ -1 +1 @@
--old
-+new
+@@ -0,0 +1 @@
++new content
 ```
 "#;
     let temp_file = NamedTempFile::new().unwrap();
@@ -46,8 +49,8 @@ Some text.
     let blocks = parse_patch_blocks(temp_file.path()).unwrap();
     assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0].index, 1);
-    assert!(blocks[0].content.contains("--- a/file.txt"));
-    assert!(blocks[0].content.contains("+new"));
+    assert!(blocks[0].content.contains("+++ b/file.txt"));
+    assert!(blocks[0].content.contains("+new content"));
 }
 
 #[test]
@@ -58,8 +61,10 @@ fn test() {}
 ```
 
 ```patch
---- a/test
+--- /dev/null
 +++ b/test
+@@ -0,0 +1 @@
++test
 ```
 "#;
     let temp_file = NamedTempFile::new().unwrap();

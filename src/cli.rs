@@ -22,21 +22,18 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    #[command(about = "Tests applying patch codeblock(s) against a temporary clone of the current repository")]
+    #[command(about = "Tests applying patch codeblock(s) against a fresh empty repository in alphanumeric order")]
     Test(FileArgs),
 
-    #[command(about = "Applies patch codeblock(s) directly to the working directory repository")]
+    #[command(about = "Applies patch codeblock(s) directly to the working directory repository in alphanumeric order")]
     Apply(FileArgs),
 
-    #[command(about = "Pretty-prints/reviews patch codeblocks from Markdown file(s)")]
+    #[command(about = "Pretty-prints/reviews patch codeblocks from Markdown file(s) in alphanumeric order")]
     Show(FileArgs),
-
-    #[command(about = "Creates a new codelog file in codelog/<HEAD_hash>.md if it does not exist")]
-    Create,
 }
 
 #[derive(clap::Args, Debug)]
 pub struct FileArgs {
-    #[arg(required = true, help = "Markdown file(s) containing patch codeblocks")]
+    #[arg(help = "Markdown file(s) containing patch codeblocks. Defaults to all .md files in codelog/ in alphanumeric order if empty.")]
     pub files: Vec<PathBuf>,
 }

@@ -13,8 +13,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -28,10 +26,5 @@ jobs:
       - name: Build codelog CLI
         run: cargo build --release
 
-      - name: Run codelog test on codelog files
-        run: |
-          if [ -d "codelog" ] && [ -n "$(ls -A codelog/*.md 2>/dev/null)" ]; then
-            ./target/release/codelog test codelog/*.md
-          else
-            echo "No codelog files found in codelog/ to test."
-          fi
+      - name: Run codelog test
+        run: ./target/release/codelog test

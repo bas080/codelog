@@ -14,59 +14,30 @@ pub fn run(cli: Cli) -> Result<()> {
         crate::cli::Commands::Test(args) => run_test(&args.files, cli.verbose),
         crate::cli::Commands::Apply(args) => run_apply(&args.files, cli.verbose),
         crate::cli::Commands::Show(args) => run_show(&args.files, cli.verbose),
-        crate::cli::Commands::Create => run_create(cli.verbose),
     }
 }
 
-pub fn extract_commit_hash_from_filename(path: &Path) -> Option<String> {
-    let stem = path.file_stem()?.to_str()?;
-    if stem.len() == 40 && stem.chars().all(|c| c.is_ascii_hexdigit()) {
-        Some(stem.to_string())
-    } else {
-        None
-    }
-}
-
-fn get_head_commit_hash() -> Result<String> {
-    let output = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .context("Failed to execute git rev-parse HEAD")?;
-
-    if !output.status.success() {
-        bail!("Failed to get HEAD commit hash");
-    }
-
-    let hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if hash.len() == 40 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
-        Ok(hash)
-    } else {
-        bail!("Invalid HEAD commit hash returned: {}", hash);
-    }
-}
-
-fn run_create(verbose: bool) -> Result<()> {
-    let hash = get_head_commit_hash()?;
-    let codelog_dir = PathBuf::from("codelog");
-    fs::create_dir_all(&codelog_dir)?;
-
-    let target_file = codelog_dir.join(format!("{}.md", hash));
-    if target_file.exists() {
-        if verbose {
-            println!("[codelog] File already exists: {}", target_file.display());
-        } else {
-            println!("Codelog file already exists: {}", target_file.display());
+pub fn resolve_and_sort_files(files: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut resolved = if files.is_empty() {
+        let codelog_dir = PathBuf::from("codelog");
+        if !codelog_dir.exists() || !codelog_dir.is_dir() {
+            return Ok(Vec::new());
         }
-        return Ok(());
-    }
+        let mut found = Vec::new();
+        for entry in fs::read_dir(codelog_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("md") {
+                found.push(path);
+            }
+        }
+        found
+    } else {
+        files.to_vec()
+    };
 
-    let template = format!(
-        "# Codelog: Commit {}\n\n## Context & Motivation\n\nExplain why this change is necessary.\n\n```patch\n\n```\n",
-        hash
-    );
-    fs::write(&target_file, template)?;
-    println!("Created codelog file: {}", target_file.display());
-    Ok(())
+    resolved.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
+    Ok(resolved)
 }
 
 fn apply_patch_to_dir(repo_dir: &Path, patch: &PatchBlock) -> Result<(), String> {
@@ -99,31 +70,10 @@ fn apply_patch_to_dir(repo_dir: &Path, patch: &PatchBlock) -> Result<(), String>
     }
 }
 
-fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let dst_path = dst.join(entry.file_name());
-
-        if entry.file_name() == "target" {
-            continue;
-        }
-
-        if ty.is_dir() {
-            copy_dir_all(&entry.path(), &dst_path)?;
-        } else {
-            fs::copy(entry.path(), dst_path)?;
-        }
-    }
-    Ok(())
-}
-
-fn prepare_temp_repo() -> Result<(PathBuf, Option<TempDir>)> {
-    let current_dir = env::current_dir().context("Failed to get current working directory")?;
+fn create_empty_temp_repo() -> Result<(PathBuf, Option<TempDir>)> {
     let custom_tmpdir = env::var("CODELOG_TMPDIR").ok().filter(|s| !s.is_empty());
 
-    if let Some(tmpdir_str) = custom_tmpdir {
+    let (target_dir, temp_guard) = if let Some(tmpdir_str) = custom_tmpdir {
         let custom_path = PathBuf::from(&tmpdir_str);
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -131,178 +81,119 @@ fn prepare_temp_repo() -> Result<(PathBuf, Option<TempDir>)> {
             .unwrap_or(0);
         let target_dir = custom_path.join(format!("codelog-repo-{}", timestamp));
         fs::create_dir_all(&target_dir)?;
-
-        copy_dir_all(&current_dir, &target_dir)?;
-        Ok((target_dir, None))
+        (target_dir, None)
     } else {
         let temp_dir = tempfile::Builder::new()
             .prefix("codelog-repo-")
             .tempdir()
             .context("Failed to create temporary directory")?;
         let target_dir = temp_dir.path().to_path_buf();
-        copy_dir_all(&current_dir, &target_dir)?;
-        Ok((target_dir, Some(temp_dir)))
+        (target_dir, Some(temp_dir))
+    };
+
+    let init_output = Command::new("git")
+        .current_dir(&target_dir)
+        .arg("init")
+        .output()
+        .context("Failed to execute git init in temporary directory")?;
+
+    if !init_output.status.success() {
+        let err = String::from_utf8_lossy(&init_output.stderr);
+        bail!("Failed to initialize empty git repo in temp dir: {}", err);
     }
+
+    Ok((target_dir, temp_guard))
 }
 
 fn run_test(files: &[PathBuf], verbose: bool) -> Result<()> {
-    let (temp_repo_dir, _temp_dir_guard) = prepare_temp_repo()?;
+    let target_files = resolve_and_sort_files(files)?;
+    if target_files.is_empty() {
+        println!("[codelog] No codelog Markdown files found.");
+        return Ok(());
+    }
+
+    let (temp_repo_dir, _temp_dir_guard) = create_empty_temp_repo()?;
 
     println!(
-        "[codelog] Cloned repository to temporary directory: {}",
+        "[codelog] Initialized empty repository in temporary directory: {}",
         temp_repo_dir.display()
     );
 
     let mut total_blocks = Vec::new();
-    for file in files {
+    for file in &target_files {
         let blocks = parse_patch_blocks(file)
             .with_context(|| format!("Failed to parse markdown file: {}", file.display()))?;
         total_blocks.extend(blocks);
     }
 
-    let file_names_str = files
+    let file_names_str = target_files
         .iter()
         .map(|f| f.display().to_string())
         .collect::<Vec<_>>()
         .join(", ");
     println!(
-        "[codelog] Found {} patch codeblocks in {}",
+        "[codelog] Found {} patch codeblock(s) across sorted file(s): {}",
         total_blocks.len(),
         file_names_str
     );
     println!();
 
-    for file in files {
-        let blocks = parse_patch_blocks(file)?;
+    let total_count = total_blocks.len();
+    for (i, patch) in total_blocks.iter().enumerate() {
+        let idx = i + 1;
+        let file_str = patch.file_path.display();
+        print!(
+            "[{}/{}] Applying patch block #{} ({}:{})... ",
+            idx, total_count, patch.index, file_str, patch.start_line
+        );
+        std::io::stdout().flush().ok();
 
-        if let Some(target_hash) = extract_commit_hash_from_filename(file) {
-            let parent_commit = format!("{}~1", target_hash);
-            if verbose {
+        match apply_patch_to_dir(&temp_repo_dir, patch) {
+            Ok(()) => {
+                println!("SUCCESS");
+            }
+            Err(err_msg) => {
+                println!("FAILED\n");
                 println!(
-                    "[codelog] Checking out parent commit {} in temporary repository...",
-                    parent_commit
+                    "✖ Error: Patch block #{} in {}:{} failed to apply.\n",
+                    patch.index, file_str, patch.start_line
                 );
-            }
-            let checkout_output = Command::new("git")
-                .current_dir(&temp_repo_dir)
-                .args(["checkout", "-q", &parent_commit])
-                .output()
-                .context("Failed to checkout parent commit in temporary repository")?;
-
-            if !checkout_output.status.success() {
-                let err = String::from_utf8_lossy(&checkout_output.stderr);
-                bail!(
-                    "Failed to checkout parent commit {} in temp repo: {}",
-                    parent_commit,
-                    err
-                );
-            }
-
-            let total_count = blocks.len();
-            for (i, patch) in blocks.iter().enumerate() {
-                let idx = i + 1;
-                let file_str = patch.file_path.display();
-                print!(
-                    "[{}/{}] Applying patch block #{} ({}:{})... ",
-                    idx, total_count, patch.index, file_str, patch.start_line
-                );
-                std::io::stdout().flush().ok();
-
-                match apply_patch_to_dir(&temp_repo_dir, patch) {
-                    Ok(()) => {
-                        println!("SUCCESS");
-                    }
-                    Err(err_msg) => {
-                        println!("FAILED\n");
-                        println!(
-                            "✖ Error: Patch block #{} in {}:{} failed to apply.\n",
-                            patch.index, file_str, patch.start_line
-                        );
-                        println!("--- Raw 'git apply' output ---");
-                        println!("{}", err_msg);
-                        println!("------------------------------\n");
-                        bail!("Patch execution failed.");
-                    }
-                }
-            }
-
-            if verbose {
-                println!(
-                    "[codelog] Verifying diff against target commit {}...",
-                    target_hash
-                );
-            }
-            let diff_output = Command::new("git")
-                .current_dir(&temp_repo_dir)
-                .args(["diff", "--exit-code", &target_hash])
-                .output()
-                .context("Failed to execute git diff in temporary repository")?;
-
-            if !diff_output.status.success() {
-                let diff_str = String::from_utf8_lossy(&diff_output.stdout);
-                println!("✖ Error: State after applying patches does not match commit {}.", target_hash);
-                if !diff_str.is_empty() {
-                    println!("--- Git Diff Output ---");
-                    println!("{}", diff_str);
-                    println!("----------------------");
-                }
-                bail!("State after applying codelog patches differs from commit {}.", target_hash);
-            }
-        } else {
-            let total_count = blocks.len();
-            for (i, patch) in blocks.iter().enumerate() {
-                let idx = i + 1;
-                let file_str = patch.file_path.display();
-                print!(
-                    "[{}/{}] Applying patch block #{} ({}:{})... ",
-                    idx, total_count, patch.index, file_str, patch.start_line
-                );
-                std::io::stdout().flush().ok();
-
-                match apply_patch_to_dir(&temp_repo_dir, patch) {
-                    Ok(()) => {
-                        println!("SUCCESS");
-                    }
-                    Err(err_msg) => {
-                        println!("FAILED\n");
-                        println!(
-                            "✖ Error: Patch block #{} in {}:{} failed to apply.\n",
-                            patch.index, file_str, patch.start_line
-                        );
-                        println!("--- Raw 'git apply' output ---");
-                        println!("{}", err_msg);
-                        println!("------------------------------\n");
-                        bail!("Patch execution failed.");
-                    }
-                }
+                println!("--- Raw 'git apply' output ---");
+                println!("{}", err_msg);
+                println!("------------------------------\n");
+                bail!("Patch execution failed.");
             }
         }
     }
 
     println!();
-    println!("✔ All patches applied successfully in temporary repository!\n");
-    println!("Follow-up steps:");
-    println!(
-        "  • Inspect changes in temp repo:  cd {} && git diff",
-        temp_repo_dir.display()
-    );
-    println!(
-        "  • Apply patches to main repo:     codelog apply {}",
-        file_names_str
-    );
-    println!(
-        "  • Clean up temporary clone:       rm -rf {}",
-        temp_repo_dir.display()
-    );
+    println!("✔ All patches applied successfully in temporary empty repository!\n");
+    if verbose {
+        println!("Follow-up steps:");
+        println!(
+            "  • Inspect generated source in temp repo: cd {}",
+            temp_repo_dir.display()
+        );
+        println!(
+            "  • Clean up temporary repo:              rm -rf {}",
+            temp_repo_dir.display()
+        );
+    }
 
     Ok(())
 }
 
 fn run_apply(files: &[PathBuf], verbose: bool) -> Result<()> {
     let current_dir = env::current_dir().context("Failed to get current working directory")?;
+    let target_files = resolve_and_sort_files(files)?;
+
+    if target_files.is_empty() {
+        println!("[codelog] No codelog Markdown files found.");
+        return Ok(());
+    }
 
     let mut total_blocks = Vec::new();
-    for file in files {
+    for file in &target_files {
         let blocks = parse_patch_blocks(file)
             .with_context(|| format!("Failed to parse markdown file: {}", file.display()))?;
         total_blocks.extend(blocks);
@@ -310,7 +201,7 @@ fn run_apply(files: &[PathBuf], verbose: bool) -> Result<()> {
 
     if verbose {
         println!(
-            "[codelog] Applying {} patch blocks directly to working directory",
+            "[codelog] Applying {} patch block(s) in alphanumeric order directly to working directory",
             total_blocks.len()
         );
     }
@@ -361,8 +252,14 @@ fn is_delta_available() -> bool {
 
 fn run_show(files: &[PathBuf], _verbose: bool) -> Result<()> {
     let use_delta = is_delta_available();
+    let target_files = resolve_and_sort_files(files)?;
 
-    for file in files {
+    if target_files.is_empty() {
+        println!("[codelog] No codelog Markdown files found.");
+        return Ok(());
+    }
+
+    for file in &target_files {
         let blocks = parse_patch_blocks(file)
             .with_context(|| format!("Failed to parse markdown file: {}", file.display()))?;
 
